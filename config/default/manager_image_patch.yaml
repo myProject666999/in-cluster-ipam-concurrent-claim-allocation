@@ -1,0 +1,12 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller-manager
+  namespace: system
+spec:
+  template:
+    spec:
+      containers:
+      - name: manager
+        image: gcr.io/k8s-staging-capi-ipam-ic/cluster-api-ipam-in-cluster-controller:dev
+        imagePullPolicy: Always

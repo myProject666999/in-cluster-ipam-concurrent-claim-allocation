@@ -1,0 +1,12 @@
+# See the OWNERS docs at https://go.k8s.io/owners#owners_aliases
+
+aliases:
+  cluster-api-ipam-provider-in-cluster-maintainers:
+    - schrej
+    - srm09
+    - mcbenjemaa
+
+  cluster-api-ipam-provider-in-cluster-reviewers:
+    - schrej
+    - srm09
+    - mcbenjemaa

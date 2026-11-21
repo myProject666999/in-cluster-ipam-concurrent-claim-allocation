@@ -1,0 +1,38 @@
+/*
+Copyright 2023 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// Package types contains shared types that lack a better home.
+package types
+
+import (
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/api/v1alpha2"
+)
+
+// GenericInClusterPool is a common interface for InClusterIPPool and GlobalInClusterIPPool.
+type GenericInClusterPool interface {
+	client.Object
+	PoolSpec() *v1alpha2.InClusterIPPoolSpec
+	PoolStatus() *v1alpha2.InClusterIPPoolStatus
+}
+
+// GenericInClusterPrefixPool is a common interface for InClusterPrefixPool and GlobalInClusterPrefixPool.
+type GenericInClusterPrefixPool interface {
+	client.Object
+	PoolSpec() *v1alpha2.InClusterPrefixPoolSpec
+	PoolStatus() *v1alpha2.InClusterPrefixPoolStatus
+}
