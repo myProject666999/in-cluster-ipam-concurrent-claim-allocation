@@ -20,9 +20,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
+	"net/netip"
 	"time"
 
+	"go4.org/netipx"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	ipamv1 "sigs.k8s.io/cluster-api/api/ipam/v1beta2"
@@ -44,23 +46,15 @@ type genericInClusterPool interface {
 	PoolSpec() *v1alpha2.InClusterIPPoolSpec
 }
 
-//+kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=inclusterippools,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=inclusterippools/status,verbs=get;update;patch
-//+kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=inclusterippools/finalizers,verbs=update
-//+kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=globalinclusterippools,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=globalinclusterippools/status,verbs=get;update;patch
-//+kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=globalinclusterippools/finalizers,verbs=update
-//+kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=ipaddressclaims,verbs=get;list;watch;update;patch
-//+kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=ipaddresses,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=ipaddressclaims/status;ipaddresses/status,verbs=get;update;patch
-//+kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=ipaddressclaims/finalizers;ipaddresses/finalizers,verbs=update
-//+kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters,verbs=get;list;watch
-
 // IPAddressClaimHandler reconciles claims against IP address pool resources.
 type IPAddressClaimHandler struct {
 	client.Client
-	claim *ipamv1.IPAddressClaim
-	pool  genericInClusterPool
+	Scheme *runtime.Scheme
+	// APIReader performs uncached reads of the claim's own IPAddress objects.
+	// It is optional; when nil the (cached) Client is used.
+	APIReader client.Reader
+	claim     *ipamv1.IPAddressClaim
+	pool      genericInClusterPool
 }
 
 var _ ipamutil.ClaimHandler = &IPAddressClaimHandler{}
@@ -124,39 +118,32 @@ func (h *IPAddressClaimHandler) FetchPool(ctx context.Context) (client.Object, *
 	return h.pool, nil, nil
 }
 
-// EnsureAddress ensures that the IPAddress contains a valid address.
-func (h *IPAddressClaimHandler) EnsureAddress(ctx context.Context, address *ipamv1.IPAddress) (*ctrl.Result, error) {
-	addressesInUse, err := poolutil.ListAddressesInUse(ctx, h.Client, h.pool.GetNamespace(), h.claim.Spec.PoolRef)
+// EnsureAddress ensures that exactly one IPAddress exists for the claim and
+// returns it. See claimAddressAllocator for the concurrency model.
+func (h *IPAddressClaimHandler) EnsureAddress(ctx context.Context) (*ipamv1.IPAddress, *ctrl.Result, error) {
+	poolSpec := h.pool.PoolSpec()
+
+	poolIPSet, err := poolutil.PoolSpecToIPSet(poolSpec)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list addresses: %w", err)
+		return nil, nil, fmt.Errorf("failed to convert pool to range: %w", err)
 	}
 
-	allocated := slices.ContainsFunc(addressesInUse, func(a ipamv1.IPAddress) bool {
-		return a.Name == address.Name && a.Namespace == address.Namespace
-	})
-
-	if !allocated {
-		poolSpec := h.pool.PoolSpec()
-		inUseIPSet, err := poolutil.AddressesToIPSet(buildAddressList(addressesInUse, poolSpec.Gateway))
-		if err != nil {
-			return nil, fmt.Errorf("failed to convert IPAddressList to IPSet: %w", err)
-		}
-
-		poolIPSet, err := poolutil.PoolSpecToIPSet(poolSpec)
-		if err != nil {
-			return nil, fmt.Errorf("failed to convert pool to range: %w", err)
-		}
-
-		freeIP, err := poolutil.FindFreeAddress(poolIPSet, inUseIPSet)
-		if err != nil {
-			return nil, fmt.Errorf("failed to find free address: %w", err)
-		}
-
-		address.Spec.Address = freeIP.String()
-		address.Spec.Gateway = poolSpec.Gateway
-		address.Spec.Prefix = ptr.To(int32(poolSpec.Prefix)) //nolint:gosec
+	strategy := &ipPoolStrategy{
+		claimKey:  fmt.Sprintf("%s/%s", h.claim.Namespace, h.claim.Name),
+		reference: h.claim.Spec.PoolRef,
+		poolSpec:  poolSpec,
+		poolIPSet: poolIPSet,
 	}
-	return nil, nil
+
+	allocator := &claimAddressAllocator{
+		client:   h.Client,
+		reader:   h.APIReader,
+		scheme:   h.Scheme,
+		claim:    h.claim,
+		pool:     h.pool,
+		strategy: strategy,
+	}
+	return allocator.ensure(ctx)
 }
 
 // ReleaseAddress implements the grace period logic for IP address reuse.
@@ -192,6 +179,64 @@ func (h *IPAddressClaimHandler) ReleaseAddress(ctx context.Context) (*ctrl.Resul
 	}
 
 	return nil, nil
+}
+
+// ipPoolStrategy allocates single IP addresses from an (Global)InClusterIPPool.
+type ipPoolStrategy struct {
+	claimKey  string
+	reference ipamv1.IPPoolReference
+	poolSpec  *v1alpha2.InClusterIPPoolSpec
+	poolIPSet *netipx.IPSet
+}
+
+var _ allocationStrategy = &ipPoolStrategy{}
+
+func (s *ipPoolStrategy) poolRef() ipamv1.IPPoolReference { return s.reference }
+
+func (s *ipPoolStrategy) preferredCandidate(name string) *allocationCandidate {
+	addr, err := poolutil.ObjectNameToAddress(name)
+	if err != nil {
+		// Object names created by older controller versions are claim names.
+		return nil
+	}
+	return &allocationCandidate{address: addr, prefixLength: int32(s.poolSpec.Prefix)} //nolint:gosec // Prefix is validated to [0,128]
+}
+
+func (s *ipPoolStrategy) chooseCandidate(inUse []ipamv1.IPAddress, conflicted []netip.Addr, attempt int, preferred *allocationCandidate) (allocationCandidate, error) {
+	inUseAddresses := buildAddressList(inUse, s.poolSpec.Gateway)
+	for _, addr := range conflicted {
+		inUseAddresses = append(inUseAddresses, addr.String())
+	}
+
+	inUseIPSet, err := poolutil.AddressesToIPSet(inUseAddresses)
+	if err != nil {
+		return allocationCandidate{}, fmt.Errorf("failed to convert IPAddressList to IPSet: %w", err)
+	}
+
+	freeSet, err := poolutil.FreeAddressSet(s.poolIPSet, inUseIPSet)
+	if err != nil {
+		return allocationCandidate{}, fmt.Errorf("failed to compute free address set: %w", err)
+	}
+
+	var preferredAddr *netip.Addr
+	if preferred != nil {
+		preferredAddr = &preferred.address
+	}
+
+	addr, err := poolutil.CandidateAddress(freeSet, s.claimKey, attempt, preferredAddr)
+	if err != nil {
+		return allocationCandidate{}, err
+	}
+	return allocationCandidate{address: addr, prefixLength: int32(s.poolSpec.Prefix)}, nil //nolint:gosec // Prefix is validated to [0,128]
+}
+
+func (s *ipPoolStrategy) specFor(c allocationCandidate) ipamv1.IPAddressSpec {
+	return ipamv1.IPAddressSpec{
+		PoolRef: s.reference,
+		Address: c.address.String(),
+		Gateway: s.poolSpec.Gateway,
+		Prefix:  ptr.To(c.prefixLength),
+	}
 }
 
 func buildAddressList(addressesInUse []ipamv1.IPAddress, gateway string) []string {

@@ -3,6 +3,8 @@ package ipamutil
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -73,9 +75,19 @@ type ClaimHandler interface {
 	// Note that the ClaimReconciler will call the ReleaseAddress method regardless whether fetching the pool was
 	// successful or not.
 	FetchPool(ctx context.Context) (client.Object, *ctrl.Result, error)
-	// EnsureAddress is called to make sure that the IPAddress.Spec is correct and the address is allocated.
-	// It will only be called when FetchPool was successful.
-	EnsureAddress(ctx context.Context, address *ipamv1.IPAddress) (*ctrl.Result, error)
+	// EnsureAddress makes sure that exactly one IPAddress exists for the claim and returns it.
+	//
+	// Implementations must be idempotent (reconciling the same claim again must return the same
+	// address) and safe for concurrent use by any number of goroutines and controller replicas.
+	// Providers must rely on the atomicity of the storage layer - e.g. unique object names or
+	// resource-version preconditions - and must not assume single-threaded or single-replica
+	// execution: during a leader-election handover an old and a new replica can process the same
+	// claim at the same time.
+	//
+	// A non-nil result with a nil error means no address could be allocated yet (e.g. the pool is
+	// exhausted) and the claim should be reconciled again later. It will only be called when
+	// FetchPool was successful.
+	EnsureAddress(ctx context.Context) (*ipamv1.IPAddress, *ctrl.Result, error)
 	// ReleaseAddress is called to release the ip address that was allocated for the claim.
 	// It will be called even if FetchPool was not successful when reconciling a deleted claim, so there is no guarantee
 	// that the claim is available in the handler.
@@ -213,35 +225,14 @@ func (r *ClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ct
 		return r.reconcileDelete(ctx, claim, handler)
 	}
 
-	// We always ensure there is a valid address object passed to the handler.
-	// The handler will complete it with the ip address.
-	address := NewIPAddress(claim, pool)
-
-	// Patch or create the address, ensuring necessary owner references and labels are set
-	operationResult, err := controllerutil.CreateOrPatch(ctx, r.Client, &address, func() error {
-		if res, err = handler.EnsureAddress(ctx, &address); err != nil {
-			return err
-		}
-
-		if err = ensureIPAddressOwnerReferences(r.Scheme, &address, claim, pool); err != nil {
-			return errors.Wrap(err, "failed to ensure owner references on address")
-		}
-
-		if val, ok := claim.Labels[clusterv1.ClusterNameLabel]; ok {
-			if address.Labels == nil {
-				address.Labels = make(map[string]string)
-			}
-			address.Labels[clusterv1.ClusterNameLabel] = val
-		}
-
-		_ = controllerutil.AddFinalizer(&address, ProtectAddressFinalizer)
-
-		return nil
-	})
-
+	// The handler ensures an IPAddress exists for the claim. For the in-cluster provider this
+	// relies on the atomicity of the storage layer (create conflicts on address-derived object
+	// names), so it is safe no matter how many reconciler goroutines or controller replicas run
+	// concurrently - including an old and a new leader overlapping during a handover.
+	address, res, err := handler.EnsureAddress(ctx)
 	if res != nil || err != nil {
 		if err != nil {
-			err = errors.Wrap(err, "failed to create or patch address")
+			err = errors.Wrap(err, "failed to ensure address")
 		}
 		return unwrapResult(res), err
 	}
@@ -251,7 +242,7 @@ func (r *ClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ct
 	// This is required, otherwise if the next "EnsureAddress" is called too fast, or the controller-runtime cached client informer
 	// is too slow, we may end up not seeing that the IP Address is being used and can provide duplicated IPs.
 	err = wait.PollUntilContextTimeout(ctx, 5*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
-		key := client.ObjectKeyFromObject(&address)
+		key := client.ObjectKeyFromObject(address)
 		if err := r.Client.Get(ctx, key, &ipamv1.IPAddress{}); err != nil {
 			return false, client.IgnoreNotFound(err)
 		}
@@ -263,7 +254,7 @@ func (r *ClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ct
 		return ctrl.Result{}, errors.Wrapf(err, "failed waiting for IPAddress %s/%s to be visible in the cache after create", address.GetNamespace(), address.GetName())
 	}
 
-	log.Info(fmt.Sprintf("IPAddress %s/%s (%s) has been %s", address.Namespace, address.Name, address.Spec.Address, operationResult),
+	log.Info(fmt.Sprintf("IPAddress %s/%s (%s) has been ensured", address.Namespace, address.Name, address.Spec.Address),
 		"IPAddressClaim", fmt.Sprintf("%s/%s", claim.Namespace, claim.Name))
 
 	if !address.DeletionTimestamp.IsZero() {
@@ -286,16 +277,12 @@ func (r *ClaimReconciler) reconcileDelete(ctx context.Context, claim *ipamv1.IPA
 		return *res, nil
 	}
 
-	address := &ipamv1.IPAddress{}
-	namespacedName := types.NamespacedName{
-		Namespace: claim.Namespace,
-		Name:      claim.Name,
-	}
-	if err := r.Client.Get(ctx, namespacedName, address); err != nil && !apierrors.IsNotFound(err) {
+	address, err := r.findAddressForClaim(ctx, claim)
+	if err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "failed to fetch address")
 	}
 
-	if address.Name != "" {
+	if address != nil {
 		var err error
 		p := client.MergeFrom(address.DeepCopy())
 		if controllerutil.RemoveFinalizer(address, ProtectAddressFinalizer) {
@@ -313,6 +300,48 @@ func (r *ClaimReconciler) reconcileDelete(ctx context.Context, claim *ipamv1.IPA
 
 	controllerutil.RemoveFinalizer(claim, ReleaseAddressFinalizer)
 	return ctrl.Result{}, nil
+}
+
+// findAddressForClaim locates the IPAddress that belongs to the given claim.
+//
+// It first tries the name recorded in the claim status. If that is unset or
+// stale (for example because the status update failed after the address was
+// created), it falls back to scanning the claim's namespace for an IPAddress
+// whose spec references both this claim and this pool. That scan is what makes
+// an in-flight allocation recoverable: the address object itself carries enough
+// ownership information (claimRef, poolRef, owner references) to find it again,
+// so a claim deleted mid-allocation does not leak an unreachable address.
+func (r *ClaimReconciler) findAddressForClaim(ctx context.Context, claim *ipamv1.IPAddressClaim) (*ipamv1.IPAddress, error) {
+	if name := claim.Status.AddressRef.Name; name != "" {
+		address := &ipamv1.IPAddress{}
+		err := r.Client.Get(ctx, types.NamespacedName{Namespace: claim.Namespace, Name: name}, address)
+		if err == nil {
+			return address, nil
+		}
+		if !apierrors.IsNotFound(err) {
+			return nil, err
+		}
+	}
+
+	addresses := &ipamv1.IPAddressList{}
+	if err := r.Client.List(ctx, addresses, client.InNamespace(claim.Namespace)); err != nil {
+		return nil, err
+	}
+	var matches []ipamv1.IPAddress
+	for _, a := range addresses.Items {
+		if a.Spec.ClaimRef.Name == claim.Name &&
+			a.Spec.PoolRef.Name == claim.Spec.PoolRef.Name &&
+			a.Spec.PoolRef.Kind == claim.Spec.PoolRef.Kind {
+			matches = append(matches, a)
+		}
+	}
+	if len(matches) == 0 {
+		return nil, nil
+	}
+	// Deterministic choice if several objects reference the claim; the
+	// allocation path converges them to this same winner.
+	slices.SortFunc(matches, func(a, b ipamv1.IPAddress) int { return strings.Compare(a.Name, b.Name) })
+	return &matches[0], nil
 }
 
 func (r *ClaimReconciler) clusterToIPClaims(_ context.Context, a client.Object) []reconcile.Request {

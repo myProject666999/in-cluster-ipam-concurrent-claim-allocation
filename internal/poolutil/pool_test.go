@@ -815,6 +815,60 @@ var _ = Describe("Prefix allocation helpers", func() {
 	})
 })
 
+var _ = Describe("FindFreePrefixAt", func() {
+	It("returns successive prefixes in deterministic left-to-right order", func() {
+		cfg := &PrefixPoolConfig{
+			Prefixes:               []string{"fd00::/62"},
+			AllocationPrefixLength: 64,
+		}
+
+		got := make([]string, 0, 4)
+		for i := range 4 {
+			prefix, err := FindFreePrefixAt(cfg, nil, i)
+			Expect(err).NotTo(HaveOccurred())
+			got = append(got, prefix.String())
+		}
+		Expect(got).To(Equal([]string{
+			"fd00::/64",
+			"fd00:0:0:1::/64",
+			"fd00:0:0:2::/64",
+			"fd00:0:0:3::/64",
+		}))
+
+		// Out of range yields ErrNoPrefixAvailable.
+		_, err := FindFreePrefixAt(cfg, nil, 4)
+		Expect(err).To(MatchError(ErrNoPrefixAvailable))
+	})
+
+	It("skips in-use and excluded prefixes consistently with counting", func() {
+		cfg := &PrefixPoolConfig{
+			Prefixes:               []string{"fd00::/62"},
+			AllocationPrefixLength: 64,
+			ExcludedPrefixes:       []string{"fd00:0:0:1::/64"},
+		}
+		inUse, err := AddressesToAllocationPrefixSet([]ipamv1.IPAddress{
+			{Spec: ipamv1.IPAddressSpec{Address: "fd00:0:0:2::", Prefix: ptr.To(int32(64))}},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		count, err := PrefixCandidateCount(cfg)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(count).To(Equal(3)) // four /64s minus the excluded :1::; runtime in-use state is not counted
+
+		// fd00::/62 has four /64s: ::, :1::, :2::, :3::.
+		// :1:: excluded, :2:: in use => free: ::, :3::.
+		got := make([]string, 0, 2)
+		for i := range 2 {
+			prefix, err := FindFreePrefixAt(cfg, inUse, i)
+			Expect(err).NotTo(HaveOccurred())
+			got = append(got, prefix.String())
+		}
+		Expect(got).To(Equal([]string{"fd00::/64", "fd00:0:0:3::/64"}))
+		_, err = FindFreePrefixAt(cfg, inUse, 2)
+		Expect(err).To(MatchError(ErrNoPrefixAvailable))
+	})
+})
+
 func mustParse(ipString string) netip.Addr {
 	ip, err := netip.ParseAddr(ipString)
 	ExpectWithOffset(1, err).NotTo(HaveOccurred())

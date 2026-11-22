@@ -151,6 +151,8 @@ func main() {
 		WatchFilterValue: watchFilter,
 		Adapter: &controllers.InClusterProviderAdapter{
 			Client:           mgr.GetClient(),
+			APIReader:        mgr.GetAPIReader(),
+			Scheme:           mgr.GetScheme(),
 			WatchFilterValue: watchFilter,
 		},
 	}).SetupWithManager(ctx, mgr); err != nil {

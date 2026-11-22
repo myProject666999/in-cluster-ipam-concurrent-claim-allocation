@@ -61,8 +61,27 @@ func NewPrefixPoolConfig(spec *v1alpha2.InClusterPrefixPoolSpec) *PrefixPoolConf
 	}
 }
 
-// FindFreePrefix returns the next free prefix based on pool config and existing allocations.
+// ErrNoPrefixAvailable reports that the pool configuration leaves no
+// allocatable sub-prefix of the required length.
+var ErrNoPrefixAvailable = errors.New("no prefix available")
+
+// FindFreePrefix returns the first free prefix (lowest address) based on pool
+// config and existing allocations.
 func FindFreePrefix(poolConfig *PrefixPoolConfig, inUseIPSet *netipx.IPSet) (netip.Prefix, error) {
+	return FindFreePrefixAt(poolConfig, inUseIPSet, 0)
+}
+
+// FindFreePrefixAt returns the index-th allocatable prefix, in deterministic
+// left-to-right order over the pool's aggregates. An index beyond the number of
+// allocatable prefixes yields ErrNoPrefixAvailable.
+//
+// Ordering is stable for a given (config, inUse) pair, so two allocators that
+// observe the same snapshot and use the same index pick the same prefix - the
+// same guarantee CandidateAddress provides for single addresses. Starting later
+// attempts at a claim-derived index (see poolutil.ScatterIndex) spreads
+// competing allocators across the free space instead of making all of them
+// probe the first free prefix.
+func FindFreePrefixAt(poolConfig *PrefixPoolConfig, inUseIPSet *netipx.IPSet, index int) (netip.Prefix, error) {
 	allocLen, err := validatedAllocationPrefixLength(poolConfig)
 	if err != nil {
 		return netip.Prefix{}, err
@@ -78,13 +97,16 @@ func FindFreePrefix(poolConfig *PrefixPoolConfig, inUseIPSet *netipx.IPSet) (net
 		return netip.Prefix{}, err
 	}
 
+	remaining := index
 	for _, aggregate := range sortedPrefixes(poolIPSet.Prefixes()) {
-		if freePrefix, ok := findFreePrefixInAggregate(aggregate, allocLen, blockedIPSet); ok {
-			return freePrefix, nil
+		count := countAllocatablePrefixesInAggregate(aggregate, allocLen, blockedIPSet)
+		if remaining < count {
+			return kthAllocatablePrefixInAggregate(aggregate, allocLen, blockedIPSet, remaining)
 		}
+		remaining -= count
 	}
 
-	return netip.Prefix{}, errors.New("no prefix available")
+	return netip.Prefix{}, ErrNoPrefixAvailable
 }
 
 // PrefixCandidateCount returns the count of allocatable prefixes from the pool configuration.
@@ -230,54 +252,58 @@ func sortedPrefixes(prefixes []netip.Prefix) []netip.Prefix {
 	return sorted
 }
 
-// findFreePrefixInAggregate performs a recursive binary search within an aggregate prefix
-// to find the first available child prefix of exactly targetBits length.
-// It splits the aggregate into halves, checking each sub-prefix in left-to-right order
-// until a free (non-blocked) slot is found.
-func findFreePrefixInAggregate(aggregate netip.Prefix, targetBits int, blockedIPSet *netipx.IPSet) (netip.Prefix, bool) {
-	// The aggregate must be a valid prefix.
+// kthAllocatablePrefixInAggregate returns the k-th (0-based) allocatable child
+// prefix of exactly targetBits length within aggregate, in left-to-right order.
+// It mirrors the counting in countAllocatablePrefixesInAggregate: fully free
+// subtrees are indexed arithmetically, fully blocked subtrees are skipped, and
+// partially blocked subtrees are split recursively.
+func kthAllocatablePrefixInAggregate(aggregate netip.Prefix, targetBits int, blockedIPSet *netipx.IPSet, k int) (netip.Prefix, error) {
 	if !aggregate.IsValid() {
-		return netip.Prefix{}, false
+		return netip.Prefix{}, ErrNoPrefixAvailable
 	}
 
 	bits := aggregate.Bits()
-	// The aggregate must be at least as large as the target (fewer bits = larger prefix),
-	// and the target must fit within the address family's bit length.
 	if bits > targetBits || bits < 0 || targetBits > aggregate.Addr().BitLen() {
-		return netip.Prefix{}, false
+		return netip.Prefix{}, ErrNoPrefixAvailable
 	}
 
-	// The entire aggregate is blocked (fully covered by excluded or in-use prefixes).
 	if blockedIPSet.ContainsPrefix(aggregate) {
-		return netip.Prefix{}, false
+		return netip.Prefix{}, ErrNoPrefixAvailable
 	}
 
-	// No part of the aggregate is blocked => take the first (lowest-address) child prefix.
 	if !blockedIPSet.OverlapsPrefix(aggregate) {
-		if bits == targetBits {
-			return aggregate, true
+		if k < 0 || k >= twoPowerCapped(targetBits-bits) {
+			return netip.Prefix{}, ErrNoPrefixAvailable
 		}
-		return netip.PrefixFrom(aggregate.Addr(), targetBits).Masked(), true
+		return prefixAtIndex(aggregate, targetBits, k), nil
 	}
 
-	// The aggregate is partially blocked but already at target size => unusable.
 	if bits == targetBits {
-		return netip.Prefix{}, false
+		return netip.Prefix{}, ErrNoPrefixAvailable
 	}
 
-	// Split in half and recurse for deterministic first-fit allocation.
 	left, right, ok := splitPrefix(aggregate)
 	if !ok {
-		return netip.Prefix{}, false
+		return netip.Prefix{}, ErrNoPrefixAvailable
 	}
 
-	if prefix, found := findFreePrefixInAggregate(left, targetBits, blockedIPSet); found {
-		return prefix, true
+	leftCount := countAllocatablePrefixesInAggregate(left, targetBits, blockedIPSet)
+	if k < leftCount {
+		return kthAllocatablePrefixInAggregate(left, targetBits, blockedIPSet, k)
 	}
-	return findFreePrefixInAggregate(right, targetBits, blockedIPSet)
+	return kthAllocatablePrefixInAggregate(right, targetBits, blockedIPSet, k-leftCount)
 }
 
-// countAllocatablePrefixesInAggregate mirrors the search logic of findFreePrefixInAggregate
+// prefixAtIndex returns the index-th child prefix of the given length inside
+// aggregate, treating the children as a contiguous, address-ordered array.
+func prefixAtIndex(aggregate netip.Prefix, targetBits, index int) netip.Prefix {
+	hostBits := aggregate.Addr().BitLen() - targetBits
+	offset := big.NewInt(int64(index))
+	offset.Lsh(offset, uint(hostBits))
+	return netip.PrefixFrom(addressAtOffset(aggregate.Addr(), offset), targetBits).Masked()
+}
+
+// countAllocatablePrefixesInAggregate counts allocatable prefixes using the same recursive splitting as kthAllocatablePrefixInAggregate
 // but instead of returning the first free prefix, it counts all allocatable child prefixes.
 // It uses the same recursive binary splitting: fully blocked subtrees contribute 0,
 // fully free subtrees contribute 2^(targetBits - bits), and partially blocked subtrees

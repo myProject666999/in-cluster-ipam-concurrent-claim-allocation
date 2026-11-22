@@ -20,8 +20,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
+	"net/netip"
 
+	"go4.org/netipx"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	ipamv1 "sigs.k8s.io/cluster-api/api/ipam/v1beta2"
@@ -41,8 +43,12 @@ import (
 // PrefixIPAddressClaimHandler reconciles claims against prefix pool resources.
 type PrefixIPAddressClaimHandler struct {
 	client.Client
-	claim *ipamv1.IPAddressClaim
-	pool  pooltypes.GenericInClusterPrefixPool
+	Scheme *runtime.Scheme
+	// APIReader performs uncached reads of the claim's own IPAddress objects.
+	// It is optional; when nil the (cached) Client is used.
+	APIReader client.Reader
+	claim     *ipamv1.IPAddressClaim
+	pool      pooltypes.GenericInClusterPrefixPool
 }
 
 var _ ipamutil.ClaimHandler = &PrefixIPAddressClaimHandler{}
@@ -106,40 +112,112 @@ func (h *PrefixIPAddressClaimHandler) FetchPool(ctx context.Context) (client.Obj
 	return h.pool, nil, nil
 }
 
-// EnsureAddress ensures that the IPAddress contains a valid prefix allocation.
-func (h *PrefixIPAddressClaimHandler) EnsureAddress(ctx context.Context, address *ipamv1.IPAddress) (*ctrl.Result, error) {
-	addressesInUse, err := poolutil.ListAddressesInUse(ctx, h.Client, h.pool.GetNamespace(), h.claim.Spec.PoolRef)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list addresses: %w", err)
+// EnsureAddress ensures that exactly one IPAddress with a valid prefix
+// allocation exists for the claim and returns it. See claimAddressAllocator for
+// the concurrency model: the object is named after the allocated prefix's
+// first address, so create uniqueness serializes competing allocators.
+func (h *PrefixIPAddressClaimHandler) EnsureAddress(ctx context.Context) (*ipamv1.IPAddress, *ctrl.Result, error) {
+	strategy := &prefixPoolStrategy{
+		claimKey:  fmt.Sprintf("%s/%s", h.claim.Namespace, h.claim.Name),
+		reference: h.claim.Spec.PoolRef,
+		config:    poolutil.NewPrefixPoolConfig(h.pool.PoolSpec()),
+		gateway:   h.pool.PoolSpec().Gateway,
 	}
 
-	allocated := slices.ContainsFunc(addressesInUse, func(a ipamv1.IPAddress) bool {
-		return a.Name == address.Name && a.Namespace == address.Namespace
-	})
-
-	if !allocated {
-		poolSpec := h.pool.PoolSpec()
-		inUseIPSet, err := poolutil.AddressesToAllocationPrefixSet(addressesInUse)
-		if err != nil {
-			return nil, fmt.Errorf("failed to convert IPAddressList to allocation prefix set: %w", err)
-		}
-
-		freePrefix, err := poolutil.FindFreePrefix(poolutil.NewPrefixPoolConfig(poolSpec), inUseIPSet)
-		if err != nil {
-			return nil, fmt.Errorf("failed to find free prefix: %w", err)
-		}
-
-		address.Spec.Address = freePrefix.Addr().String()
-		address.Spec.Gateway = poolSpec.Gateway
-		address.Spec.Prefix = ptr.To(int32(freePrefix.Bits())) //nolint:gosec // Bits() is [0,128] for valid prefixes
+	allocator := &claimAddressAllocator{
+		client:   h.Client,
+		reader:   h.APIReader,
+		scheme:   h.Scheme,
+		claim:    h.claim,
+		pool:     h.pool,
+		strategy: strategy,
 	}
-	return nil, nil
+	return allocator.ensure(ctx)
 }
 
 // ReleaseAddress releases the allocated prefix.
 func (h *PrefixIPAddressClaimHandler) ReleaseAddress(_ context.Context) (*ctrl.Result, error) {
 	// We don't need to do anything here, since the prefix is released when the IPAddress is deleted.
 	return nil, nil
+}
+
+// prefixPoolStrategy allocates sub-prefixes from an
+// (Global)InClusterPrefixPool.
+type prefixPoolStrategy struct {
+	claimKey  string
+	reference ipamv1.IPPoolReference
+	config    *poolutil.PrefixPoolConfig
+	gateway   string
+}
+
+var _ allocationStrategy = &prefixPoolStrategy{}
+
+func (s *prefixPoolStrategy) poolRef() ipamv1.IPPoolReference { return s.reference }
+
+func (s *prefixPoolStrategy) preferredCandidate(name string) *allocationCandidate {
+	addr, err := poolutil.ObjectNameToAddress(name)
+	if err != nil || !poolutil.PrefixIsAllocatable(netip.PrefixFrom(addr, s.config.AllocationPrefixLength), s.config) {
+		return nil
+	}
+	return &allocationCandidate{address: addr, prefixLength: int32(s.config.AllocationPrefixLength)} //nolint:gosec // validated to [1,128]
+}
+
+func (s *prefixPoolStrategy) chooseCandidate(inUse []ipamv1.IPAddress, conflicted []netip.Addr, attempt int, preferred *allocationCandidate) (allocationCandidate, error) {
+	inUseIPSet, err := poolutil.AddressesToAllocationPrefixSet(inUse)
+	if err != nil {
+		return allocationCandidate{}, fmt.Errorf("failed to convert IPAddressList to allocation prefix set: %w", err)
+	}
+	if len(conflicted) > 0 {
+		builder := &netipx.IPSetBuilder{}
+		builder.AddSet(inUseIPSet)
+		for _, addr := range conflicted {
+			builder.AddPrefix(netip.PrefixFrom(addr, s.config.AllocationPrefixLength))
+		}
+		if inUseIPSet, err = builder.IPSet(); err != nil {
+			return allocationCandidate{}, fmt.Errorf("failed to update allocation prefix set: %w", err)
+		}
+	}
+
+	// Attempt 0 keeps the historical first-fit choice (the lowest free prefix),
+	// so uncontended allocation order and address reuse are unchanged. Later
+	// attempts probe at a claim-derived index and then advance by one per
+	// attempt, so competing claims spread over the free space instead of all
+	// retrying the same first free prefix. The order is deterministic for a
+	// given snapshot, so two replicas of the same claim still converge.
+	index := 0
+	if attempt > 0 {
+		index = attempt
+		if window, err := poolutil.PrefixCandidateCount(s.config); err == nil && window > 0 {
+			index = (poolutil.ScatterIndex(s.claimKey, attempt, window) + attempt) % window
+		}
+	}
+
+	if preferred != nil && attempt == 0 {
+		// Re-acquire the prefix recorded in the claim status if it is still
+		// free, keeping allocations stable when the IPAddress object was lost.
+		candidate := netip.PrefixFrom(preferred.address, s.config.AllocationPrefixLength)
+		if !inUseIPSet.OverlapsPrefix(candidate) {
+			return allocationCandidate{address: candidate.Addr(), prefixLength: int32(candidate.Bits())}, nil //nolint:gosec // Bits() is [0,128]
+		}
+	}
+
+	freePrefix, err := poolutil.FindFreePrefixAt(s.config, inUseIPSet, index)
+	if err != nil {
+		if errors.Is(err, poolutil.ErrNoPrefixAvailable) {
+			return allocationCandidate{}, poolutil.ErrNoFreeAddress
+		}
+		return allocationCandidate{}, err
+	}
+	return allocationCandidate{address: freePrefix.Addr(), prefixLength: int32(freePrefix.Bits())}, nil //nolint:gosec // Bits() is [0,128]
+}
+
+func (s *prefixPoolStrategy) specFor(c allocationCandidate) ipamv1.IPAddressSpec {
+	return ipamv1.IPAddressSpec{
+		PoolRef: s.reference,
+		Address: c.address.String(),
+		Gateway: s.gateway,
+		Prefix:  ptr.To(c.prefixLength),
+	}
 }
 
 func prefixPoolStatus(o client.Object) *v1alpha2.InClusterPrefixPoolStatusAddresses {

@@ -99,7 +99,7 @@ var _ = BeforeSuite(func() {
 		(&ipamutil.ClaimReconciler{
 			Client:  mgr.GetClient(),
 			Scheme:  mgr.GetScheme(),
-			Adapter: &InClusterProviderAdapter{Client: mgr.GetClient()},
+			Adapter: &InClusterProviderAdapter{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme()},
 		}).SetupWithManager(ctx, mgr),
 	).To(Succeed())
 

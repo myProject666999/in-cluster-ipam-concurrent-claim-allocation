@@ -31,6 +31,7 @@ import (
 	. "sigs.k8s.io/controller-runtime/pkg/envtest/komega"
 
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/api/v1alpha2"
+	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/poolutil"
 )
 
 var _ = Describe("IPAddressClaimReconciler prefix allocation", func() {
@@ -76,20 +77,20 @@ var _ = Describe("IPAddressClaimReconciler prefix allocation", func() {
 			Expect(k8sClient.Create(context.Background(), &claim1)).To(Succeed())
 			Expect(k8sClient.Create(context.Background(), &claim2)).To(Succeed())
 
-			Eventually(findAddress("prefix-claim-1", namespace)).
+			Eventually(findAddress(poolutil.AddressToObjectName(netip.MustParseAddr("fd00::")), namespace)).
 				WithTimeout(time.Second).WithPolling(100 * time.Millisecond).Should(
 				HaveField("Spec.Address", "fd00::"))
-			Eventually(findAddress("prefix-claim-1", namespace)).
+			Eventually(findAddress(poolutil.AddressToObjectName(netip.MustParseAddr("fd00::")), namespace)).
 				WithTimeout(time.Second).WithPolling(100 * time.Millisecond).Should(
 				HaveField("Spec.Prefix", Equal(ptr.To(int32(64)))))
-			Eventually(findAddress("prefix-claim-1", namespace)).
+			Eventually(findAddress(poolutil.AddressToObjectName(netip.MustParseAddr("fd00::")), namespace)).
 				WithTimeout(time.Second).WithPolling(100 * time.Millisecond).Should(
 				HaveField("Spec.Gateway", "fd10::1"))
 
-			Eventually(findAddress("prefix-claim-2", namespace)).
+			Eventually(findAddress(poolutil.AddressToObjectName(netip.MustParseAddr("fd00:0:0:1::")), namespace)).
 				WithTimeout(time.Second).WithPolling(100 * time.Millisecond).Should(
 				HaveField("Spec.Address", "fd00:0:0:1::"))
-			Eventually(findAddress("prefix-claim-2", namespace)).
+			Eventually(findAddress(poolutil.AddressToObjectName(netip.MustParseAddr("fd00:0:0:1::")), namespace)).
 				WithTimeout(time.Second).WithPolling(100 * time.Millisecond).Should(
 				HaveField("Spec.Prefix", Equal(ptr.To(int32(64)))))
 
@@ -138,7 +139,7 @@ var _ = Describe("IPAddressClaimReconciler prefix allocation", func() {
 				delete(pool.Annotations, clusterv1.PausedAnnotation)
 				Expect(k8sClient.Update(context.Background(), pool)).To(Succeed())
 
-				Eventually(findAddress("paused-prefix-claim", namespace)).
+				Eventually(findAddress(poolutil.AddressToObjectName(netip.MustParseAddr("fd04::")), namespace)).
 					WithTimeout(5 * time.Second).WithPolling(100 * time.Millisecond).Should(
 					HaveField("Spec.Address", "fd04::"))
 			})
@@ -177,17 +178,17 @@ var _ = Describe("IPAddressClaimReconciler prefix allocation", func() {
 			Expect(k8sClient.Create(context.Background(), &claim1)).To(Succeed())
 			Expect(k8sClient.Create(context.Background(), &claim2)).To(Succeed())
 
-			Eventually(findAddress("custom-prefix-claim-1", namespace)).
+			Eventually(findAddress(poolutil.AddressToObjectName(netip.MustParseAddr("fd06::")), namespace)).
 				WithTimeout(5 * time.Second).WithPolling(100 * time.Millisecond).Should(
 				HaveField("Spec.Address", "fd06::"))
-			Eventually(findAddress("custom-prefix-claim-1", namespace)).
+			Eventually(findAddress(poolutil.AddressToObjectName(netip.MustParseAddr("fd06::")), namespace)).
 				WithTimeout(5 * time.Second).WithPolling(100 * time.Millisecond).Should(
 				HaveField("Spec.Prefix", Equal(ptr.To(int32(56)))))
 
-			Eventually(findAddress("custom-prefix-claim-2", namespace)).
+			Eventually(findAddress(poolutil.AddressToObjectName(netip.MustParseAddr("fd06:0:0:100::")), namespace)).
 				WithTimeout(5 * time.Second).WithPolling(100 * time.Millisecond).Should(
 				HaveField("Spec.Address", "fd06:0:0:100::"))
-			Eventually(findAddress("custom-prefix-claim-2", namespace)).
+			Eventually(findAddress(poolutil.AddressToObjectName(netip.MustParseAddr("fd06:0:0:100::")), namespace)).
 				WithTimeout(5 * time.Second).WithPolling(100 * time.Millisecond).Should(
 				HaveField("Spec.Prefix", Equal(ptr.To(int32(56)))))
 
@@ -226,20 +227,20 @@ var _ = Describe("IPAddressClaimReconciler prefix allocation", func() {
 			claim1 := newClaim("mixed-prefix-claim-1", namespace, inClusterPrefixPoolKind, poolName)
 			Expect(k8sClient.Create(context.Background(), &claim1)).To(Succeed())
 
-			Eventually(findAddress("mixed-prefix-claim-1", namespace)).
+			Eventually(findAddress(poolutil.AddressToObjectName(netip.MustParseAddr("fd00:0:0:1::")), namespace)).
 				WithTimeout(5 * time.Second).WithPolling(100 * time.Millisecond).Should(
 				HaveField("Spec.Address", "fd00:0:0:1::"))
-			Eventually(findAddress("mixed-prefix-claim-1", namespace)).
+			Eventually(findAddress(poolutil.AddressToObjectName(netip.MustParseAddr("fd00:0:0:1::")), namespace)).
 				WithTimeout(5 * time.Second).WithPolling(100 * time.Millisecond).Should(
 				HaveField("Spec.Prefix", Equal(ptr.To(int32(64)))))
 
 			claim2 := newClaim("mixed-prefix-claim-2", namespace, inClusterPrefixPoolKind, poolName)
 			Expect(k8sClient.Create(context.Background(), &claim2)).To(Succeed())
 
-			Eventually(findAddress("mixed-prefix-claim-2", namespace)).
+			Eventually(findAddress(poolutil.AddressToObjectName(netip.MustParseAddr("fd10::")), namespace)).
 				WithTimeout(5 * time.Second).WithPolling(100 * time.Millisecond).Should(
 				HaveField("Spec.Address", "fd10::"))
-			Eventually(findAddress("mixed-prefix-claim-2", namespace)).
+			Eventually(findAddress(poolutil.AddressToObjectName(netip.MustParseAddr("fd10::")), namespace)).
 				WithTimeout(5 * time.Second).WithPolling(100 * time.Millisecond).Should(
 				HaveField("Spec.Prefix", Equal(ptr.To(int32(64)))))
 		})
@@ -273,17 +274,17 @@ var _ = Describe("IPAddressClaimReconciler prefix allocation", func() {
 			Expect(k8sClient.Create(context.Background(), &claim1)).To(Succeed())
 			Expect(k8sClient.Create(context.Background(), &claim2)).To(Succeed())
 
-			Eventually(findAddress("global-prefix-claim-1", namespace)).
+			Eventually(findAddress(poolutil.AddressToObjectName(netip.MustParseAddr("fd01::")), namespace)).
 				WithTimeout(time.Second).WithPolling(100 * time.Millisecond).Should(
 				HaveField("Spec.Address", "fd01::"))
-			Eventually(findAddress("global-prefix-claim-1", namespace)).
+			Eventually(findAddress(poolutil.AddressToObjectName(netip.MustParseAddr("fd01::")), namespace)).
 				WithTimeout(time.Second).WithPolling(100 * time.Millisecond).Should(
 				HaveField("Spec.Prefix", Equal(ptr.To(int32(64)))))
 
-			Eventually(findAddress("global-prefix-claim-2", namespace2)).
+			Eventually(findAddress(poolutil.AddressToObjectName(netip.MustParseAddr("fd01:0:0:1::")), namespace2)).
 				WithTimeout(time.Second).WithPolling(100 * time.Millisecond).Should(
 				HaveField("Spec.Address", "fd01:0:0:1::"))
-			Eventually(findAddress("global-prefix-claim-2", namespace2)).
+			Eventually(findAddress(poolutil.AddressToObjectName(netip.MustParseAddr("fd01:0:0:1::")), namespace2)).
 				WithTimeout(time.Second).WithPolling(100 * time.Millisecond).Should(
 				HaveField("Spec.Prefix", Equal(ptr.To(int32(64)))))
 		})
@@ -316,14 +317,14 @@ var _ = Describe("IPAddressClaimReconciler prefix allocation", func() {
 			claim := newClaim("prefix-del-claim", namespace, inClusterPrefixPoolKind, poolName)
 			Expect(k8sClient.Create(context.Background(), &claim)).To(Succeed())
 
-			Eventually(findAddress("prefix-del-claim", namespace)).
+			Eventually(findAddress(poolutil.AddressToObjectName(netip.MustParseAddr("fd05::")), namespace)).
 				WithTimeout(time.Second).WithPolling(100 * time.Millisecond).Should(
 				HaveField("Spec.Address", "fd05::"))
 
 			deleteClaim("prefix-del-claim", namespace)
 
 			Eventually(Get(&ipamv1.IPAddress{ObjectMeta: metav1.ObjectMeta{
-				Name:      "prefix-del-claim",
+				Name:      poolutil.AddressToObjectName(netip.MustParseAddr("fd05::")),
 				Namespace: namespace,
 			}})).WithTimeout(5 * time.Second).WithPolling(100 * time.Millisecond).Should(Not(Succeed()))
 		})
@@ -361,7 +362,7 @@ var _ = Describe("IPAddressClaimReconciler prefix allocation", func() {
 			Expect(k8sClient.Create(context.Background(), &claim1)).To(Succeed())
 			Expect(k8sClient.Create(context.Background(), &claim2)).To(Succeed())
 
-			Eventually(findAddress("exhausted-claim-1", namespace)).
+			Eventually(findAddress(poolutil.AddressToObjectName(netip.MustParseAddr("fd07::")), namespace)).
 				WithTimeout(5 * time.Second).WithPolling(100 * time.Millisecond).Should(
 				HaveField("Spec.Address", "fd07::"))
 

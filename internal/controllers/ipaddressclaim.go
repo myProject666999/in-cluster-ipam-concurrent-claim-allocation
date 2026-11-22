@@ -20,6 +20,7 @@ import (
 	"context"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	ipamv1 "sigs.k8s.io/cluster-api/api/ipam/v1beta2"
 	"sigs.k8s.io/cluster-api/util/annotations"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -37,7 +38,14 @@ import (
 
 // InClusterProviderAdapter is used as middle layer for provider integration.
 type InClusterProviderAdapter struct {
-	Client           client.Client
+	Client client.Client
+	// APIReader is an uncached reader used to verify a claim's own allocations.
+	// Allocation is safe without it, but a stale informer cache could otherwise
+	// make an allocator believe the claim has no address and create a
+	// duplicate (which is then converged, at the cost of an extra round trip).
+	// Optional: when nil, the cached Client is used.
+	APIReader        client.Reader
+	Scheme           *runtime.Scheme
 	WatchFilterValue string
 }
 
@@ -67,7 +75,11 @@ func (i *InClusterProviderAdapter) SetupWithManager(_ context.Context, b *ctrl.B
 			),
 		)).
 		WithOptions(controller.Options{
-			// To avoid race conditions when allocating IP Addresses, we explicitly set this to 1
+			// Allocation correctness does not depend on this setting: IPAddress
+			// objects are named after the allocated address, so the API server's
+			// create uniqueness resolves races between any number of reconciler
+			// goroutines or controller replicas. Keeping the default of 1 merely
+			// reduces avoidable create conflicts.
 			MaxConcurrentReconciles: 1,
 		}).
 		Watches(
@@ -130,13 +142,17 @@ func (i *InClusterProviderAdapter) ClaimHandlerFor(_ client.Client, claim *ipamv
 	switch claim.Spec.PoolRef.Kind {
 	case inClusterPrefixPoolKind, globalInClusterPrefixPoolKind:
 		return &PrefixIPAddressClaimHandler{
-			Client: i.Client,
-			claim:  claim,
+			Client:    i.Client,
+			APIReader: i.APIReader,
+			Scheme:    i.Scheme,
+			claim:     claim,
 		}
 	default:
 		return &IPAddressClaimHandler{
-			Client: i.Client,
-			claim:  claim,
+			Client:    i.Client,
+			APIReader: i.APIReader,
+			Scheme:    i.Scheme,
+			claim:     claim,
 		}
 	}
 }
